@@ -17,6 +17,7 @@
 
 import json
 import time
+import sys
 
 from networkx.readwrite import json_graph
 import numpy as np
@@ -28,6 +29,7 @@ import tensorflow.compat.v1 as tf
 from tensorflow.compat.v1 import gfile
 
 import networkx as nx
+import pickle as pkl 
 from sklearn.model_selection import train_test_split 
 flags = tf.app.flags
 FLAGS = flags.FLAGS
@@ -119,6 +121,18 @@ def construct_feed_dict(features, support, labels, labels_mask, placeholders):
   feed_dict.update({placeholders['num_features_nonzero']: features[1].shape})
   return feed_dict
 
+def construct_feed_dict_afm(features,features_idx,features_val, support, labels, labels_mask, placeholders):
+  """Construct feed dictionary for AFM."""
+  feed_dict = dict()
+  feed_dict.update({placeholders['labels']: labels})
+  feed_dict.update({placeholders['labels_mask']: labels_mask})
+  feed_dict.update({placeholders['features']: features})
+  feed_dict.update({placeholders['features_idx']: features_idx})
+  feed_dict.update({placeholders['features_val']: features_val})
+  feed_dict.update({placeholders['support']: support})
+  feed_dict.update({placeholders['num_features_nonzero']: features[1].shape})
+  return feed_dict
+
 
 def preprocess_multicluster(adj,
                             parts,
@@ -127,7 +141,8 @@ def preprocess_multicluster(adj,
                             train_mask,
                             num_clusters,
                             block_size,
-                            diag_lambda=-1):
+                            diag_lambda=-1,
+                            feat_sparse=False):
   """Generate the batch for multiple clusters."""
 
   features_batches = []
@@ -140,11 +155,13 @@ def preprocess_multicluster(adj,
     pt = parts[st]
     for pt_idx in range(st + 1, min(st + block_size, num_clusters)): 
       pt = np.concatenate((pt, parts[pt_idx]), axis=0)  # concat [st: st+block_size] in a batch
-    features_batches.append(features[pt, :])
+    features_batches.append(sparse_to_tuple(features[pt, :])) if feat_sparse else features_batches.append(features[pt, :])
     y_train_batches.append(y_train[pt, :])
     support_now = adj[pt, :][:, pt]
     if diag_lambda == -1: # no diag enhance
       support_batches.append(sparse_to_tuple(normalize_adj(support_now))) # renormalize adj
+    elif diag_lambda == -2:
+      support_batches.append(sparse_to_tuple(sym_normalize_adj(support_now))) # renormalize adj
     else:
       support_batches.append(
           sparse_to_tuple(normalize_adj_diag_enhance(support_now, diag_lambda)))
@@ -158,7 +175,7 @@ def preprocess_multicluster(adj,
   return (features_batches, support_batches, y_train_batches,
           train_mask_batches)
 
-
+# TODO: 增加判断是否是sparse feature input，features_batches元素为sparse tuple
 def preprocess(adj,
                features,
                y_train,
@@ -173,6 +190,8 @@ def preprocess(adj,
                                                     num_clusters)
   if diag_lambda == -1:
     part_adj = normalize_adj(part_adj)
+  elif diag_lambda == -2:
+    part_adj = sym_normalize_adj(part_adj)
   else:
     part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
   parts = [np.array(pt) for pt in parts]
@@ -195,6 +214,165 @@ def preprocess(adj,
         train_pt.append(newidx)
     train_mask_batches.append(sample_mask(train_pt, len(pt)))
   return (parts, features_batches, support_batches, y_train_batches,
+          train_mask_batches)
+
+# TODO: 增加一次划分得到train/test/val的代码以测试一次划分效果
+def preprocess_val_test(adj,
+               features,
+               y_val,
+               val_mask,
+               y_test,
+               test_mask,
+               visible_data,
+               num_clusters,
+               diag_lambda=-1):
+  """Do graph partitioning and preprocessing for SGD training. Patition validation and test set in the same time"""
+
+  # Do graph partitioning
+  part_adj, parts = partition_utils.partition_graph(adj, visible_data,
+                                                    num_clusters)
+  if diag_lambda == -1:
+    part_adj = normalize_adj(part_adj)
+  elif diag_lambda == -2:
+    part_adj = sym_normalize_adj(part_adj)
+  else:
+    part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
+  parts = [np.array(pt) for pt in parts]
+
+  features_val_batches = []
+  support_batches = []
+  y_val_batches = []
+  val_mask_batches = []
+  y_test_batches = []
+  test_mask_batches = []
+  total_nnz = 0
+  for pt in parts:
+    features_val_batches.append(sparse_to_tuple(features[pt, :]))
+    now_part = part_adj[pt, :][:, pt]
+    total_nnz += now_part.count_nonzero()
+    support_batches.append(sparse_to_tuple(now_part))
+    y_val_batches.append(y_val[pt, :])
+    y_test_batches.append(y_test[pt, :])
+
+    val_pt = []
+    test_pt = []
+    for newidx, idx in enumerate(pt):
+      if val_mask[idx]:
+        val_pt.append(newidx)
+      if test_mask[idx]:
+        test_pt.append(newidx)
+    val_mask_batches.append(sample_mask(val_pt, len(pt)))
+    test_mask_batches.append(sample_mask(test_pt, len(pt)))
+  features_test_batches = features_val_batches
+  return (parts, features_val_batches, features_test_batches, support_batches, y_val_batches,y_test_batches,
+          val_mask_batches, test_mask_batches)
+
+###################################
+##  Data preprocess for GCN_AFM  ##
+###################################
+
+def preprocess_val_test_afm(adj,
+               features,
+               features_idx,
+               features_val,
+               y_val,
+               val_mask,
+               y_test,
+               test_mask,
+               visible_data,
+               num_clusters,
+               diag_lambda=-1):
+  """Do graph partitioning and preprocessing for SGD training. Patition validation and test set in the same time"""
+
+  # Do graph partitioning
+  part_adj, parts = partition_utils.partition_graph(adj, visible_data,
+                                                    num_clusters)
+  if diag_lambda == -1:
+    part_adj = normalize_adj(part_adj)
+  elif diag_lambda == -2:
+    part_adj = sym_normalize_adj(part_adj)
+  else:
+    part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
+  parts = [np.array(pt) for pt in parts]
+
+  # TODO: feature_idx/ feature_val的计算只与验证集和测试集自身有关，无需加入训练集
+  features_val_batches = [[],[],[]] # [features_sp, features_idx, features_val]
+  support_batches = []
+  y_val_batches = []
+  val_mask_batches = []
+  y_test_batches = []
+  test_mask_batches = []
+  total_nnz = 0
+  for pt in parts:
+    features_val_batches[0].append(sparse_to_tuple(features[pt, :]))  # features_sp
+    features_val_batches[1].append(features_idx[pt,:])
+    features_val_batches[2].append(features_idx[pt,:])
+
+    now_part = part_adj[pt, :][:, pt]
+    total_nnz += now_part.count_nonzero()
+    support_batches.append(sparse_to_tuple(now_part))
+    y_val_batches.append(y_val[pt, :])
+    y_test_batches.append(y_test[pt, :])
+
+    val_pt = []
+    test_pt = []
+    for newidx, idx in enumerate(pt):
+      if val_mask[idx]:
+        val_pt.append(newidx)
+      if test_mask[idx]:
+        test_pt.append(newidx)
+    val_mask_batches.append(sample_mask(val_pt, len(pt)))
+    test_mask_batches.append(sample_mask(test_pt, len(pt)))
+  features_test_batches = features_val_batches
+  return (parts, features_val_batches, features_test_batches, support_batches, y_val_batches,y_test_batches,
+          val_mask_batches, test_mask_batches)
+
+
+def preprocess_multicluster_afm(adj,
+                            parts,
+                            features,
+                            features_idx,
+                            features_val,
+                            y_train,
+                            train_mask,
+                            num_clusters,
+                            block_size,
+                            diag_lambda=-1,
+                            feat_sparse=False):
+  """Generate the batch for multiple clusters."""
+
+  features_batches = [[],[],[]]
+  support_batches = []
+  y_train_batches = []
+  train_mask_batches = []
+  total_nnz = 0
+  np.random.shuffle(parts)
+  for _, st in enumerate(range(0, num_clusters, block_size)):
+    pt = parts[st]
+    # merge multiple adj block
+    for pt_idx in range(st + 1, min(st + block_size, num_clusters)): 
+      pt = np.concatenate((pt, parts[pt_idx]), axis=0)  # concat [st: st+block_size] in a batch
+    features_batches[0].append(sparse_to_tuple(features[pt, :])) if feat_sparse else features_batches.append(features[pt, :])
+    features_batches[1].append(features_idx[pt, :])
+    features_batches[2].append(features_val[pt, :])
+
+    y_train_batches.append(y_train[pt, :])
+    support_now = adj[pt, :][:, pt]
+    if diag_lambda == -1: # no diag enhance
+      support_batches.append(sparse_to_tuple(normalize_adj(support_now))) # renormalize adj
+    elif diag_lambda == -2:
+      support_batches.append(sparse_to_tuple(sym_normalize_adj(support_now))) # renormalize adj
+    else:
+      support_batches.append(
+          sparse_to_tuple(normalize_adj_diag_enhance(support_now, diag_lambda)))
+    total_nnz += support_now.count_nonzero()
+
+    train_pt = []
+    for newidx, idx in enumerate(pt):
+      if train_mask[idx]:
+        train_pt.append(newidx)
+    train_mask_batches.append(sample_mask(train_pt, len(pt))) # train_mask in this batch
+  return (features_batches, support_batches, y_train_batches,
           train_mask_batches)
 
 
@@ -313,46 +491,28 @@ def load_graphsage_data(dataset_path, dataset_str, normalize=True):
 
 
 def encode_onehot(labels):
-    classes = set(labels)
-    classes_dict = {c: np.identity(len(classes))[i, :] for i, c in
-                    enumerate(classes)}
-    labels_onehot = np.array(list(map(classes_dict.get, labels)),
-                             dtype=np.int32)
-    return labels_onehot
+  """Encoder label from number to one-hot"""
+  classes = set(labels)
+  classes_dict = {c: np.identity(len(classes))[i, :] for i, c in
+                  enumerate(classes)}
+  labels_onehot = np.array(list(map(classes_dict.get, labels)),
+                            dtype=np.int32)
+  return labels_onehot
 
-"""
-load data from graph dataset:
-  edgelist:  
-  feature:
-  label:  
-"""
+
 def load_ne_data_transductive(data_prefix, dataset_str, precalc, split=[0.7,0.2,0.1],normalize=True):
-  """Return the required data formats for GCN models."""
+  """load data from graph and preprocessing: 10% train, 20% validation, 70% test"""   
   print('Loading data from graph...'.format(dataset_str))
-  if dataset_str in {'cora', 'citeseer', 'pubmed', 'wiki','acm','flickr','blogCatalog'}:
-      if dataset_str == 'acm':
-          import scipy.io as sio
-          data = sio.loadmat('./data/acm/ACM.mat')
-          features = data['Features'].tolil()
-          # features = data['Features']
-          adj = sp.csr_matrix(data['Network'])
-          labels = encode_onehot(data['Label'].flatten())
-          
-      else:
-          features = sp.lil_matrix(np.genfromtxt("./data/{}/{}.feature".format(dataset_str,dataset_str)) ,dtype=np.float32)
-          # features = np.genfromtxt("./data/graph/{}/{}.feature".format(dataset_str,dataset_str), dtype=np.float32)
-          nx_G = nx.read_edgelist("./data/{}/{}.edgelist".format(dataset_str,dataset_str), nodetype=int,create_using=nx.Graph())   
-          adj = nx.adjacency_matrix(nx_G, nodelist=range(nx_G.number_of_nodes())) # nodelist define adjacency matrix node order
-          # adj_lil = adj.tolil()
-          labels = encode_onehot(np.genfromtxt("./data/{}/{}.label".format(dataset_str,dataset_str), dtype=np.int)[:,1])
-  else:
-      
-      
-      graph_adjacency_list_file_path = os.path.join('data/new_data', dataset_str, 'out1_graph_edges.txt')
-      graph_node_features_and_labels_file_path = os.path.join('data/new_data', dataset_str,
-                                                              f'out1_node_feature_label.txt')
-      nx_G = nx.read_edgelist(graph_adjacency_list_file_path, nodetype=int,create_using=nx.Graph())
-      adj = nx.adjacency_matrix(nx_G, nodelist=range(nx_G.number_of_nodes())) # nodelist define adjacency matrix node order
+  names = ['adj', 'feature', 'label']
+  objects = []
+  for i in range(len(names)):
+      with open("data/{}/{}.{}.pkl".format(dataset_str, dataset_str, names[i]), 'rb') as f:
+          if sys.version_info > (3, 0):
+              objects.append(pkl.load(f, encoding='latin1'))
+          else:
+              objects.append(pkl.load(f))
+
+  adj, features, labels = tuple(objects)
         
   num_data = features.shape[0]
   idx = range(num_data)
@@ -363,10 +523,6 @@ def load_ne_data_transductive(data_prefix, dataset_str, precalc, split=[0.7,0.2,
   is_train = np.ones((num_data), dtype=np.bool)
   is_train[val_data] = False
   is_train[test_data] = False
-  
-  # (num_data, train_adj, full_adj, feats, train_feats, test_feats, labels,
-  #  train_data, val_data,
-  #  test_data) = utils.load_graphsage_data(data_prefix, dataset_str)
 
   y_train = np.zeros(labels.shape)
   y_val = np.zeros(labels.shape)
@@ -386,19 +542,106 @@ def load_ne_data_transductive(data_prefix, dataset_str, precalc, split=[0.7,0.2,
     r_inv[np.isinf(r_inv)] = 0.
     r_mat_inv = sp.diags(r_inv)
     features = r_mat_inv.dot(features)    
-    features = features.todense()
-  
+    
+  features = features.todense()
   train_feats = features
   test_feats = features
 
-
   if precalc:
     train_feats = adj.dot(train_feats)
+    train_feats = np.hstack((train_feats, features))
     test_feats = train_feats
-  
-  # return (train_adj, full_adj, train_feats, test_feats, y_train, y_val, y_test,
-  #         train_mask, val_mask, test_mask, train_data, val_data, test_data,
-  #         num_data, visible_data)
+
   return (adj, train_feats, test_feats, y_train, y_val, y_test,
           train_mask, val_mask, test_mask, train_data, val_data, test_data,
           num_data)
+
+
+def load_ne_data_transductive_sparse(data_prefix, dataset_str, precalc, split=[0.7,0.2,0.1],normalize=True):
+  """load data from graph and preprocessing: 10% train, 20% validation, 70% test"""   
+  print('Loading data from graph...'.format(dataset_str))
+  names = ['adj', 'feature', 'label']
+  objects = []
+  for i in range(len(names)):
+      with open("data/{}/{}.{}.pkl".format(dataset_str, dataset_str, names[i]), 'rb') as f:
+          if sys.version_info > (3, 0):
+              objects.append(pkl.load(f, encoding='latin1'))
+          else:
+              objects.append(pkl.load(f))
+
+  adj, features, labels = tuple(objects)
+        
+  num_data = features.shape[0]
+  idx = range(num_data)
+  # split train / val / test nodes
+  idx_, test_data = train_test_split(idx, test_size=split[2],random_state=FLAGS.seed)
+  train_data, val_data = train_test_split(idx_, test_size=split[1]/(split[0]+split[1]),random_state=FLAGS.seed)
+  
+  is_train = np.ones((num_data), dtype=np.bool)
+  is_train[val_data] = False
+  is_train[test_data] = False
+
+  y_train = np.zeros(labels.shape)
+  y_val = np.zeros(labels.shape)
+  y_test = np.zeros(labels.shape)
+  y_train[train_data, :] = labels[train_data, :]
+  y_val[val_data, :] = labels[val_data, :]
+  y_test[test_data, :] = labels[test_data, :]
+
+  train_mask = sample_mask(train_data, labels.shape[0])
+  val_mask = sample_mask(val_data, labels.shape[0])
+  test_mask = sample_mask(test_data, labels.shape[0])
+
+  if normalize:
+    # Row-normalize feature matrix
+    normalize_features(features)
+
+  return (adj, features, y_train, y_val, y_test,
+          train_mask, val_mask, test_mask, train_data, val_data, test_data,
+          num_data)
+
+
+def tab_printer(args):
+  """
+  Function to print the logs in a nice tabular format.
+  :param args: Parameters used for the model.
+  """
+  keys = sorted(args.keys())
+  from texttable import Texttable
+  t = Texttable()
+  t.add_rows([["Parameter", "Value"]] +  [[k.replace("_"," ").capitalize(),args[k]] for k in keys])
+  print(t.draw())
+
+
+def normalize_features(features):
+    """Row-normalize feature matrix into sparse matrix format"""
+    rowsum = np.array(features.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.
+    r_mat_inv = sp.diags(r_inv)
+    features = r_mat_inv.dot(features)
+    return features
+
+
+def preprocess_features_nonzero(features,normalize=True,threshold=100):
+    """Process nonzero feature index and value, trunc or pad for fixed length"""
+    if normalize == True:
+      features = normalize_features(features).tolil()
+    else:
+      features = features.tolil()
+    width = min(max(map(lambda x: len(x), features.rows)), threshold) # max nonzero number
+    idx = features.rows
+    val = features.data
+    idx_pad = []
+    val_pad = []
+    for row, d in zip(idx, val):
+      if len(row) <= width:
+        # padding
+        idx_pad.append(np.pad(np.array(row)+1,(0,width - len(row)), 'constant', constant_values=(0.))) # bias=1 for zero vector
+        val_pad.append(np.pad(d, (0,width - len(row)), 'constant', constant_values=(0.)))
+      else:
+        # choose width number of nonzero feature
+        choice_id = np.random.choice(range(len(row)), width, replace=False)
+        idx_pad.append(np.array(row)[choice_id] + 1)
+        val_pad.append(np.array(val)[choice_id])
+    return np.array(idx_pad, dtype=np.int32), np.array(val_pad, dtype=np.float32), width

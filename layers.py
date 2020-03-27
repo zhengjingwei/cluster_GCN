@@ -183,6 +183,7 @@ class GraphConvolution(Layer):
                featureless=False,
                norm=False,
                precalc=False,
+               residual=False,
                **kwargs):
     super(GraphConvolution, self).__init__(**kwargs)
 
@@ -198,6 +199,7 @@ class GraphConvolution(Layer):
     self.bias = bias
     self.norm = norm
     self.precalc = precalc
+    self.residual = residual
 
     # helper variable for sparse dropout
     self.num_features_nonzero = placeholders['num_features_nonzero']
@@ -219,16 +221,25 @@ class GraphConvolution(Layer):
     x = inputs
 
     # convolve
+    # according to StoGCN [Chen 2018], dropout followed by AX or followed x performs same
     if self.precalc:
-      support = x
+      support = x # dense
+      support = tf.nn.dropout(support, 1 - self.dropout)
+      output = dot(support, self.vars['weights'], sparse=self.sparse_inputs)
     else:
-      support = dot(self.support, x, sparse=True)
-      support = tf.concat((support, x), axis=1)
+      if self.residual:
+        support = dot(self.support, x, sparse=True)
+        support = tf.concat((support, x), axis=1)
+        support = tf.nn.dropout(support, 1 - self.dropout)
+        output = dot(support, self.vars['weights'], sparse=False)
+      else:
+        if self.sparse_inputs:
+            x = sparse_dropout(x, 1-self.dropout, self.num_features_nonzero)
+        else:
+            x = tf.nn.dropout(x, 1-self.dropout)
+        pre_sup = dot(x, self.vars['weights'], sparse=self.sparse_inputs) # dense
+        output = dot(self.support, pre_sup, sparse=True)
 
-    # dropout
-    support = tf.nn.dropout(support, 1 - self.dropout)
-
-    output = dot(support, self.vars['weights'], sparse=self.sparse_inputs)
 
     # bias
     if self.bias:
@@ -239,3 +250,32 @@ class GraphConvolution(Layer):
         output = layernorm(output, self.vars['offset'], self.vars['scale'])
 
     return self.act(output)
+
+
+
+  # def _call(self, inputs):
+  #   x = inputs
+
+  #   # convolve
+  #   if self.precalc:
+  #     support = x
+  #   else:
+  #     support = dot(self.support, x, sparse=True, sparse_feat=self.sparse_inputs)
+  #     if self.residual:
+  #       support = tf.concat((support, x), axis=1) # skip-connection
+
+  #   # dropout
+  #   support = tf.nn.dropout(support, 1 - self.dropout)
+
+  #   output = dot(support, self.vars['weights'], sparse=False)
+  #   # output = dot(support, self.vars['weights'], sparse=self.sparse_inputs)
+
+  #   # bias
+  #   if self.bias:
+  #     output += self.vars['bias']
+
+  #   with tf.variable_scope(self.name + '_vars'):
+  #     if self.norm:
+  #       output = layernorm(output, self.vars['offset'], self.vars['scale'])
+
+  #   return self.act(output)
