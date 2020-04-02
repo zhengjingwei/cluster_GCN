@@ -49,6 +49,11 @@ def sample_mask(idx, l):
   return np.array(mask, dtype=np.bool)
 
 
+def unnormlize_adj(adj):
+  """Add self-loop and return, not normalize"""
+  adj = adj + sp.eye(adj.shape[0])
+  return adj
+
 def sym_normalize_adj(adj):
   """Normalization by D^{-1/2} (A+I) D^{-1/2}."""
   adj = adj + sp.eye(adj.shape[0])
@@ -160,8 +165,10 @@ def preprocess_multicluster(adj,
     support_now = adj[pt, :][:, pt]
     if diag_lambda == -1: # no diag enhance
       support_batches.append(sparse_to_tuple(normalize_adj(support_now))) # renormalize adj
-    elif diag_lambda == -2:
+    elif diag_lambda == -2: # Kipf GCN
       support_batches.append(sparse_to_tuple(sym_normalize_adj(support_now))) # renormalize adj
+    elif diag_lambda == 0 and FLAGS.model =='gat_nfm':
+      support_batches.append(sparse_to_tuple(support_now))
     else:
       support_batches.append(
           sparse_to_tuple(normalize_adj_diag_enhance(support_now, diag_lambda)))
@@ -182,7 +189,8 @@ def preprocess(adj,
                train_mask,
                visible_data,
                num_clusters,
-               diag_lambda=-1):
+               diag_lambda=-1,
+               sparse_input=False):
   """Do graph partitioning and preprocessing for SGD training."""
 
   # Do graph partitioning
@@ -192,6 +200,8 @@ def preprocess(adj,
     part_adj = normalize_adj(part_adj)
   elif diag_lambda == -2:
     part_adj = sym_normalize_adj(part_adj)
+  elif diag_lambda == 0 and FLAGS.model =='gat_nfm':
+    part_adj = unnormlize_adj(part_adj)
   else:
     part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
   parts = [np.array(pt) for pt in parts]
@@ -202,7 +212,60 @@ def preprocess(adj,
   train_mask_batches = []
   total_nnz = 0
   for pt in parts:
-    features_batches.append(features[pt, :])
+    if sparse_input:
+      features_batches.append(sparse_to_tuple(features[pt, :]))
+    else:
+      features_batches.append(features[pt, :])
+    now_part = part_adj[pt, :][:, pt]
+    total_nnz += now_part.count_nonzero()
+    support_batches.append(sparse_to_tuple(now_part))
+    y_train_batches.append(y_train[pt, :])
+
+    train_pt = []
+    for newidx, idx in enumerate(pt):
+      if train_mask[idx]:
+        train_pt.append(newidx)
+    train_mask_batches.append(sample_mask(train_pt, len(pt)))
+  return (parts, features_batches, support_batches, y_train_batches,
+          train_mask_batches)
+
+
+
+def preprocess_train_afm(adj,
+               features,
+               features_idx,
+               features_val,
+               y_train,
+               train_mask,
+               visible_data,
+               num_clusters,
+               diag_lambda=-1,
+               sparse_input=False):
+  """Do graph partitioning and preprocessing for SGD training. Patition train dataset."""
+  part_adj, parts = partition_utils.partition_graph(adj, visible_data,
+                                                    num_clusters)
+  if diag_lambda == -1:
+    part_adj = normalize_adj(part_adj)
+  elif diag_lambda == -2:
+    part_adj = sym_normalize_adj(part_adj)
+  elif diag_lambda == 0 and FLAGS.model == 'gat_nfm':
+    part_adj = unnormlize_adj(part_adj)
+  else:
+    part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
+  parts = [np.array(pt) for pt in parts]
+
+  features_batches = [[],[],[]]
+  support_batches = []
+  y_train_batches = []
+  train_mask_batches = []
+  total_nnz = 0
+  for pt in parts:
+    if sparse_input:
+      features_batches[0].append(sparse_to_tuple(features[pt, :]))  # features_sp
+    else:
+      features_batches.append(features[pt, :])
+    features_batches[1].append(features_idx[pt,:])
+    features_batches[2].append(features_val[pt,:])
     now_part = part_adj[pt, :][:, pt]
     total_nnz += now_part.count_nonzero()
     support_batches.append(sparse_to_tuple(now_part))
@@ -235,6 +298,8 @@ def preprocess_val_test(adj,
     part_adj = normalize_adj(part_adj)
   elif diag_lambda == -2:
     part_adj = sym_normalize_adj(part_adj)
+  elif diag_lambda == 0 and FLAGS.model == 'gat_nfm':
+    part_adj = unnormlize_adj(part_adj)
   else:
     part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
   parts = [np.array(pt) for pt in parts]
@@ -291,6 +356,69 @@ def preprocess_val_test_afm(adj,
     part_adj = normalize_adj(part_adj)
   elif diag_lambda == -2:
     part_adj = sym_normalize_adj(part_adj)
+  elif diag_lambda == 0 and FLAGS.model =='gat_nfm':
+    part_adj = part_adj
+  else:
+    part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
+  parts = [np.array(pt) for pt in parts]
+
+  # TODO: feature_idx/ feature_val的计算只与验证集和测试集自身有关，无需加入训练集
+  features_val_batches = [[],[],[]] # [features_sp, features_idx, features_val]
+  support_batches = []
+  y_val_batches = []
+  val_mask_batches = []
+  y_test_batches = []
+  test_mask_batches = []
+  total_nnz = 0
+  for pt in parts:
+    features_val_batches[0].append(sparse_to_tuple(features[pt, :]))  # features_sp
+    features_val_batches[1].append(features_idx[pt,:])
+    features_val_batches[2].append(features_val[pt,:])
+
+    now_part = part_adj[pt, :][:, pt]
+    total_nnz += now_part.count_nonzero()
+    support_batches.append(sparse_to_tuple(now_part))
+    y_val_batches.append(y_val[pt, :])
+    y_test_batches.append(y_test[pt, :])
+
+    val_pt = []
+    test_pt = []
+    for newidx, idx in enumerate(pt):
+      if val_mask[idx]:
+        val_pt.append(newidx)
+      if test_mask[idx]:
+        test_pt.append(newidx)
+    val_mask_batches.append(sample_mask(val_pt, len(pt)))
+    test_mask_batches.append(sample_mask(test_pt, len(pt)))
+  features_test_batches = features_val_batches
+  return (parts, features_val_batches, features_test_batches, support_batches, y_val_batches,y_test_batches,
+          val_mask_batches, test_mask_batches)
+
+
+def preprocess_train_val_test_afm(adj,
+                part_adj,
+                parts,
+               features,
+               features_idx,
+               features_val,
+               y_val,
+               val_mask,
+               y_test,
+               test_mask,
+               visible_data,
+               num_clusters,
+               diag_lambda=-1):
+  """Do graph partitioning and preprocessing for SGD training. Patition validation and test set in the same time"""
+
+  # Do graph partitioning
+  part_adj, parts = partition_utils.partition_graph(adj, visible_data,
+                                                    num_clusters)
+  if diag_lambda == -1:
+    part_adj = normalize_adj(part_adj)
+  elif diag_lambda == -2:
+    part_adj = sym_normalize_adj(part_adj)
+  elif diag_lambda == 0 and FLAGS.model == 'nfm_gat':
+    part_adj = unnormlize_adj(part_adj)
   else:
     part_adj = normalize_adj_diag_enhance(part_adj, diag_lambda)
   parts = [np.array(pt) for pt in parts]
@@ -327,7 +455,6 @@ def preprocess_val_test_afm(adj,
   return (parts, features_val_batches, features_test_batches, support_batches, y_val_batches,y_test_batches,
           val_mask_batches, test_mask_batches)
 
-
 def preprocess_multicluster_afm(adj,
                             parts,
                             features,
@@ -362,6 +489,8 @@ def preprocess_multicluster_afm(adj,
       support_batches.append(sparse_to_tuple(normalize_adj(support_now))) # renormalize adj
     elif diag_lambda == -2:
       support_batches.append(sparse_to_tuple(sym_normalize_adj(support_now))) # renormalize adj
+    elif diag_lambda == 0 and FLAGS.model =='gat_nfm':
+      support_batches.append(sparse_to_tuple(support_now))
     else:
       support_batches.append(
           sparse_to_tuple(normalize_adj_diag_enhance(support_now, diag_lambda)))
@@ -560,6 +689,7 @@ def load_ne_data_transductive(data_prefix, dataset_str, precalc, split=[0.7,0.2,
 def load_ne_data_transductive_sparse(data_prefix, dataset_str, precalc, split=[0.7,0.2,0.1],normalize=True):
   """load data from graph and preprocessing: 10% train, 20% validation, 70% test"""   
   print('Loading data from graph...'.format(dataset_str))
+  print('split: ' + str(split))
   names = ['adj', 'feature', 'label']
   objects = []
   for i in range(len(names)):
@@ -576,7 +706,7 @@ def load_ne_data_transductive_sparse(data_prefix, dataset_str, precalc, split=[0
   # split train / val / test nodes
   idx_, test_data = train_test_split(idx, test_size=split[2],random_state=FLAGS.seed)
   train_data, val_data = train_test_split(idx_, test_size=split[1]/(split[0]+split[1]),random_state=FLAGS.seed)
-  
+  print('dataset: ' + dataset_str + 'train: {} val: {} test: {}'.format(len(train_data), len(val_data), len(test_data)))
   is_train = np.ones((num_data), dtype=np.bool)
   is_train[val_data] = False
   is_train[test_data] = False
@@ -637,11 +767,11 @@ def preprocess_features_nonzero(features,normalize=True,threshold=100):
     for row, d in zip(idx, val):
       if len(row) <= width:
         # padding
-        idx_pad.append(np.pad(np.array(row)+1,(0,width - len(row)), 'constant', constant_values=(0.))) # bias=1 for zero vector
+        idx_pad.append  (np.pad(np.array(row)+1,(0,width - len(row)), 'constant', constant_values=(0.))) # bias=1 for zero vector
         val_pad.append(np.pad(d, (0,width - len(row)), 'constant', constant_values=(0.)))
       else:
         # choose width number of nonzero feature
         choice_id = np.random.choice(range(len(row)), width, replace=False)
         idx_pad.append(np.array(row)[choice_id] + 1)
-        val_pad.append(np.array(val)[choice_id])
+        val_pad.append(np.array(d)[choice_id])
     return np.array(idx_pad, dtype=np.int32), np.array(val_pad, dtype=np.float32), width

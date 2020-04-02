@@ -21,14 +21,13 @@ import tensorflow.compat.v1 as tf
 
 FLAGS = tf.flags.FLAGS
 
-
 class Model(object):
   """Model class to be inherited."""
 
   def __init__(self, **kwargs):
     allowed_kwargs = {
         'name', 'logging', 'multilabel', 'norm', 'precalc', 'num_layers', 'residual', 'sparse_inputs',
-        'valid_dimension', 'act', 'attn_reg'
+        'valid_dimension', 'act', 'attn_reg', 'gat_layers'
     }
     for kwarg, _ in kwargs.items():
       assert kwarg in allowed_kwargs, 'Invalid keyword argument: ' + kwarg
@@ -62,6 +61,9 @@ class Model(object):
     self.sparse_inputs = kwargs.get('sparse_inputs', False)
     self.valid_dimension = kwargs.get('valid_dimension', 0) # max nonzero num of features
     self.attn_reg = kwargs.get('attn_reg', 0)
+
+    # GAT
+    self.gat_layers = kwargs.get('gat_layers', [16])
 
   def _build(self):
     raise NotImplementedError
@@ -525,9 +527,10 @@ class GAT_NFM(Model):
     self.placeholders = placeholders
 
     self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
-    self.hidden_dims = [input_dim, 64, 16]
+    self.hidden_dims = [input_dim] + self.gat_layers # [input_dim, 64, 16]
     self.num_layers = len(self.hidden_dims) -1
     self.define_weights(self.hidden_dims)
+    self.dropout = placeholders['dropout']
     self.fm_dropout = placeholders['fm_dropout']
     self.build()
 
@@ -546,7 +549,7 @@ class GAT_NFM(Model):
     self.C = {}
 
     self.project_layer = layers.Dense(
-            input_dim=FLAGS.hidden1 * 2,
+            input_dim=self.hidden_dims[-1] + FLAGS.fm_dims,
             output_dim=self.output_dim,
             placeholders=self.placeholders,
             act=lambda x: x,
@@ -558,8 +561,10 @@ class GAT_NFM(Model):
   def __encoder(self, A, H, layer):
         # H = tf.matmul(H, self.W[layer])
         if layer == 0:
+          H = layers.sparse_dropout(H, 1 - self.dropout, self.placeholders['num_features_nonzero'])
           H = tf.sparse_tensor_dense_matmul(H, self.W[layer])
         else:
+          H = tf.nn.dropout(H, 1 - self.dropout)
           H = tf.matmul(H, self.W[layer])
         self.C[layer] = self.graph_attention_layer(A, H, self.v[layer], layer) # attention value
         return tf.sparse_tensor_dense_matmul(self.C[layer], H)
@@ -568,6 +573,8 @@ class GAT_NFM(Model):
   def graph_attention_layer(self, A, M, v, layer):
 
     with tf.variable_scope("layer_%s"% layer):
+      # drop
+      # M = tf.nn.dropout(M, 1 - self.dropout)
       f1 = tf.matmul(M, v[0]) # (?,1)
       f1 = A * f1             # (?,) element-wise product
       f2 = tf.matmul(M, v[1]) # (?,1)
@@ -582,6 +589,12 @@ class GAT_NFM(Model):
       attentions = tf.SparseTensor(indices=attentions.indices,
                                     values=attentions.values,
                                     dense_shape=attentions.dense_shape)    # (?,)
+      
+      # attention dropout, each node is exposed to a stochastically sampled neighborhood
+      if FLAGS.gat_dropout > 0:
+        attentions = tf.SparseTensor(indices=attentions.indices,
+                                    values=tf.nn.dropout(attentions.values, 1.0 - self.placeholders['gat_dropout']),
+                                    dense_shape=attentions.dense_shape)    # (?,)
 
       return attentions
 
@@ -593,7 +606,7 @@ class GAT_NFM(Model):
 
 
     # FM
-    self.fm_embedding = tf.get_variable('fm_embedding', [self.input_dim, FLAGS.hidden1])
+    self.fm_embedding = tf.get_variable('fm_embedding', [self.input_dim, FLAGS.fm_dims])
     squared_feature_emb = tf.square(self.fm_embedding)
 
     if self.sparse_inputs:

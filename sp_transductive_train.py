@@ -25,20 +25,20 @@ flags.DEFINE_string('data_prefix', 'data', 'Datapath prefix.')
 flags.DEFINE_float('learning_rate', 0.01, 'Initial learning rate.')
 flags.DEFINE_integer('epochs', 200, 'Number of epochs to train.')
 flags.DEFINE_integer('hidden1', 16, 'Number of units in hidden layer 1.')
-flags.DEFINE_float('dropout', 0.5, 'Dropout rate (1 - keep probability).')
+flags.DEFINE_float('dropout', 0, 'Dropout rate (1 - keep probability).')
 flags.DEFINE_float('weight_decay', 0, 'Weight for L2 loss on embedding matrix.')
 flags.DEFINE_integer('early_stopping', 10,
                      'Tolerance for early stopping (# of epochs).')
-flags.DEFINE_integer('num_clusters', 10, 'Number of clusters.')
-flags.DEFINE_integer('bsize', 2, 'Number of clusters for each batch.')
-flags.DEFINE_integer('num_clusters_val', 1,
+flags.DEFINE_integer('num_clusters', 1, 'Number of clusters.')  # 10
+flags.DEFINE_integer('bsize', 2, 'Number of clusters for each batch.')  # 2
+flags.DEFINE_integer('num_clusters_val', 1, # 1
                      'Number of clusters for validation.')
 flags.DEFINE_integer('num_clusters_test', 1, 'Number of clusters for test.')
 flags.DEFINE_integer('num_layers', 2, 'Number of GCN layers.')
 flags.DEFINE_float(
-    'diag_lambda', 1,
+    'diag_lambda', 0,
     'A positive number for diagonal enhancement, -1 indicates normalization without diagonal enhancement'
-)
+) # 1
 flags.DEFINE_bool('multilabel', False, 'Multilabel or multiclass.')
 flags.DEFINE_bool('layernorm', True, 'Whether to use layer normalization.')
 flags.DEFINE_bool(
@@ -48,11 +48,16 @@ flags.DEFINE_bool('validation', True,
                   'Print validation accuracy after each epoch.')
 
 # new settings
-flags.DEFINE_list('split', [0.7, 0.2, 0.1], 'Data split.')
+flags.DEFINE_list('split', [0.2, 0.1, 0.7], 'Data split.')
 flags.DEFINE_integer('seed',100, 'Random seed.')
-flags.DEFINE_string('model','gcn', 'model name.')
+flags.DEFINE_string('model','gat_nfm', 'model name.') # gcn
 flags.DEFINE_bool('residual', False, 'Whether to use residual connection.')
 flags.DEFINE_float('fm_dropout', 0 , 'FM dropout rate (1 - keep probability).')
+flags.DEFINE_float('gat_dropout', 0, 'Graph Attention drop')
+flags.DEFINE_integer('fm_dims', 16 , 'FM embedding dims.') 
+flags.DEFINE_list('gat_layers', [32, 16], 'GAT layers')
+
+
 
 seed = FLAGS.seed
 np.random.seed(seed)
@@ -102,7 +107,7 @@ def main(unused_argv):
   utils.tab_printer(FLAGS.flag_values_dict())
   (full_adj, feats, y_train, y_val, y_test,
           train_mask, val_mask, test_mask, train_data, val_data, test_data,
-          num_data) = utils.load_ne_data_transductive_sparse(FLAGS.data_prefix, FLAGS.dataset, list(map(float,FLAGS.split)))
+          num_data) = utils.load_ne_data_transductive_sparse(FLAGS.data_prefix, FLAGS.dataset, FLAGS.precalc, list(map(float,FLAGS.split)))
   
   # Partition graph and do preprocessing
   if FLAGS.bsize > 1: # multi cluster per epoch
@@ -115,7 +120,7 @@ def main(unused_argv):
      train_mask_batches) = utils.preprocess(full_adj, feats, y_train,
                                             train_mask, np.arange(num_data),
                                             FLAGS.num_clusters,
-                                            FLAGS.diag_lambda)
+                                            FLAGS.diag_lambda,sparse_input=True)
   # valid & test in the same time
   # validation set
   (_, val_features_batches, test_features_batches, val_support_batches, y_val_batches,y_test_batches,
@@ -154,6 +159,8 @@ def main(unused_argv):
           tf.placeholder_with_default(0., shape=()),
       'fm_dropout':
           tf.placeholder_with_default(0., shape=()),
+      'gat_dropout':
+          tf.placeholder_with_default(0., shape=()), # gat attn drop
       'num_features_nonzero':
           tf.placeholder(tf.int32)  # helper variable for sparse dropout
   }
@@ -181,6 +188,7 @@ def main(unused_argv):
                       residual=False,
                       sparse_inputs=True)
   elif FLAGS.model == 'gat_nfm':
+    gat_layers = list(map(int, FLAGS.gat_layers))
     model = models.GAT_NFM(placeholders,
                       input_dim=feats.shape[1],
                       logging=True,
@@ -189,7 +197,8 @@ def main(unused_argv):
                       precalc=FLAGS.precalc,
                       num_layers=FLAGS.num_layers,
                       residual=False,
-                      sparse_inputs=True)
+                      sparse_inputs=True,
+                      gat_layers=gat_layers)
   else:
     raise ValueError(str(FLAGS.model))
 
@@ -222,7 +231,11 @@ def main(unused_argv):
                                               train_mask_b, placeholders)
         feed_dict.update({placeholders['dropout']: FLAGS.dropout})
         feed_dict.update({placeholders['fm_dropout']: FLAGS.fm_dropout})
+        feed_dict.update({placeholders['gat_dropout']: FLAGS.gat_dropout})
         # Training step
+        outs = sess.run([model.opt_op, model.loss, model.accuracy],
+                        feed_dict=feed_dict)
+        # debug
         outs = sess.run([model.opt_op, model.loss, model.accuracy],
                         feed_dict=feed_dict)
     else:
@@ -238,6 +251,7 @@ def main(unused_argv):
                                               train_mask_b, placeholders)
         feed_dict.update({placeholders['dropout']: FLAGS.dropout})
         feed_dict.update({placeholders['fm_dropout']: FLAGS.fm_dropout})
+        feed_dict.update({placeholders['gat_dropout']: FLAGS.gat_dropout})
         # Training step
         outs = sess.run([model.opt_op, model.loss, model.accuracy],
                         feed_dict=feed_dict)
